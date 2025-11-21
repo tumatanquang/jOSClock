@@ -1,0 +1,283 @@
+name: Build jOSClock Universal
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Java 8
+        uses: actions/setup-java@v5
+        with:
+          java-version: 8
+          # temurin: macOS [x64 + arm64] = Could not find satisfied version for SemVer '8'.
+          # zulu: OK
+          # liberica: OK
+          # microsoft: build-java = Could not find satisfied version for SemVer '8'.
+          # corretto: OK
+          # semeru: macOS [x64 + arm64] = Could not find satisfied version for SemVer '8'.
+          # oracle: build-java = Oracle JDK is only supported for JDK 17 and later
+          # dragonwell: macOS [x64 + arm64] = Couldn't find any satisfied version for the specified java-version: "8" and architecture: "arm64".
+          # sapmachine: build-java = Couldn't find any satisfied version for the specified java-version: "8" and architecture: "x64".
+          # graalvm: build-java = GraalVM is only supported for JDK 17 and later
+          # jetbrains: build-java = Could not find satisfied version for SemVer '8'.
+          distribution: corretto
+      - name: Prepare build directory
+        run: mkdir -p build
+      - name: Compile Java and Generate JNI headers
+        run: javac -h build -d build -encoding utf8 -extdirs "" -source 1.3 -target 1.2 -bootclasspath lib/jdk-1_2_2_017-rt.jar src/uc/j/*.java
+      - name: Upload Java classes and headers
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-build
+          path: |
+            build/uc/j/*.class
+            build/*.h
+
+  build-native:
+    needs: build-java
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - os: ubuntu-latest
+            osname: linux
+            arch: x64
+            gcc: gcc
+            soext: so
+          - os: ubuntu-latest
+            osname: linux
+            arch: x86
+            gcc: "gcc -m32"
+            soext: so
+          - os: ubuntu-latest
+            osname: linux
+            arch: arm
+            gcc: arm-linux-gnueabihf-gcc
+            soext: so
+          - os: ubuntu-latest
+            osname: linux
+            arch: arm64
+            gcc: aarch64-linux-gnu-gcc
+            soext: so
+          # Windows
+          - os: windows-2022
+            osname: windows
+            arch: x64
+            vcvars: x64
+            winsdk: 10.0.22621.0
+            soext: dll
+          - os: windows-2022
+            osname: windows
+            arch: x86
+            vcvars: x86
+            winsdk: 10.0.22621.0
+            soext: dll
+          - os: windows-2022
+            osname: windows
+            arch: arm
+            vcvars: x64_arm
+            winsdk: 10.0.22621.0
+            soext: dll
+          - os: windows-2022
+            osname: windows
+            arch: arm64
+            vcvars: x64_arm64
+            winsdk: 10.0.22621.0
+            soext: dll
+          # macOS
+          - os: macos-latest
+            osname: macos
+            arch: x64
+            clang_arch: x86_64
+            soext: dylib
+          - os: macos-latest
+            osname: macos
+            arch: arm64
+            clang_arch: arm64
+            soext: dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 8
+        uses: actions/setup-java@v5
+        with:
+          java-version: 8
+          distribution: corretto
+
+      - name: Download Java classes and headers
+        uses: actions/download-artifact@v4
+        with:
+          name: java-build
+          path: build
+
+      - name: Install cross compilers
+        if: runner.os == 'Linux'
+        run: |
+          sudo dpkg --add-architecture i386 || true
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib
+          sudo apt-get install -y gcc-arm-linux-gnueabihf gcc-aarch64-linux-gnu
+
+      - name: Prepare output dirs
+        shell: bash
+        run: |
+          mkdir -p build/uc/j
+          mkdir -p build/uc/j/native/${{ matrix.osname }}-${{ matrix.arch }}
+
+      # LINUX BUILD
+      - name: Build native lib (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ${{ matrix.gcc }} -shared -O3 -Wl,-s -fno-math-errno -fno-trapping-math -fno-signed-zeros -fno-rounding-math -fno-signaling-nans -ffinite-math-only -fexcess-precision=fast \
+            -flto -fomit-frame-pointer -fPIC -o build/uc/j/native/${{ matrix.osname }}-${{ matrix.arch }}/jOSClock.${{ matrix.soext }} \
+            -I"${JAVA_HOME}/include" -I"${JAVA_HOME}/include/linux" -I"build" uc_j_osclock.c || \
+            echo "Build fail or skip for ${{ matrix.osname }} ${{ matrix.arch }}"
+
+      # WINDOWS BUILD
+      - name: Find MSVC location (Windows)
+        if: runner.os == 'Windows'
+        id: vswhere
+        shell: pwsh
+        run: |
+          $vsPath = & 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe' -products * -latest -property installationPath
+          ECHO "VSINSTALL=$vsPath" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Build native lib (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          DEL /f /q jOSClock.exp jOSClock.lib uc_j_osclock.obj >nul 2>nul
+          CALL "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars }} ${{ matrix.winsdk }}
+          CL /LD /O2 /GL /Oi /Ot /Oy /GS- /Gy /GA /Gw /DNDEBUG /fp:fast ^
+          /I"%JAVA_HOME%\include" /I"%JAVA_HOME%\include\win32" /I"build" uc_j_osclock.c /Fe:build\uc\j\native\${{ matrix.osname }}-${{ matrix.arch }}\jOSClock.${{ matrix.soext }} ^
+          /link /LTCG /OPT:REF /OPT:ICF /INCREMENTAL:NO /RELEASE || ^
+          ECHO "Build fail or skip for ${{ matrix.osname }} ${{ matrix.arch }}"
+
+      # MACOS BUILD
+      - name: Build native lib (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          clang -arch ${{ matrix.clang_arch }} -dynamiclib -O3 -Wl,-S -Wl,-x -fno-math-errno -fno-trapping-math -fno-signed-zeros -fno-rounding-math -fno-signaling-nans -ffinite-math-only -fexcess-precision=fast \
+            -flto -fomit-frame-pointer -o build/uc/j/native/${{ matrix.osname }}-${{ matrix.arch }}/jOSClock.${{ matrix.soext }} \
+            -I"${JAVA_HOME}/include" -I"${JAVA_HOME}/include/darwin" -I"build" uc_j_osclock.c || \
+            echo "Build fail or skip for ${{ matrix.osname }} ${{ matrix.arch }}"
+
+      - name: Upload per-arch artifact (class & lib)
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ matrix.osname }}-${{ matrix.arch }}
+          path: |
+            build/uc/j/*.class
+            build/uc/j/native/${{ matrix.osname }}-${{ matrix.arch }}/*
+          if-no-files-found: ignore
+
+  # ANDROID BUILD
+  build-android:
+    needs: build-java
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Java 8
+        uses: actions/setup-java@v5
+        with:
+          java-version: 8
+          distribution: corretto
+
+      - name: Download Java classes and headers
+        uses: actions/download-artifact@v4
+        with:
+          name: java-build
+          path: build
+
+      - name: Prepare output dirs
+        run: |
+          mkdir -p build/uc/j
+          abis="armeabi-v7a arm64-v8a x86 x86_64"
+          for abi in $abis; do
+            mkdir -p build/uc/j/native/android-$abi
+          done
+
+      - name: Build JNI libs for all Android ABIs
+        run: |
+          abis="armeabi-v7a arm64-v8a x86 x86_64"
+          for abi in $abis; do
+            case $abi in
+              armeabi-v7a)
+                tool="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang"
+                outext="so"
+                ;;
+              arm64-v8a)
+                tool="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+                outext="so"
+                ;;
+              x86)
+                tool="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android21-clang"
+                outext="so"
+                ;;
+              x86_64)
+                tool="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang"
+                outext="so"
+                ;;
+            esac
+            $tool -shared -O3 -fno-math-errno -fno-trapping-math -fno-signed-zeros -fno-rounding-math -fno-signaling-nans -ffinite-math-only -fexcess-precision=fast \
+              -flto -fomit-frame-pointer -fPIC -Wl,-strip-all -o build/uc/j/native/android-$abi/jOSClock.$outext \
+              -I"${JAVA_HOME}/include" -I"${JAVA_HOME}/include/linux" -I"$ANDROID_NDK_HOME/sysroot/usr/include" -I"build" uc_j_osclock.c || \
+              echo "Build fail or skip for android-$abi"
+          done
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-android
+          path: |
+            build/uc/j/*.class
+            build/uc/j/native/android-*/jOSClock.so
+          if-no-files-found: ignore
+
+  combine-universal-jar:
+    needs: [build-native, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all arch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: extracted
+
+      - name: Prepare content for JAR (merge)
+        run: |
+          mkdir -p all/uc/j/native
+          find extracted -name '*.class' -path '*/uc/j/*.class' -exec cp -u -t all/uc/j/ {} +
+          echo "Copying native libraries..."
+          find extracted -type f \( -name "*.so" -o -name "*.dll" -o -name "*.dylib" \) -path '*/native/*' | while read -r libfile; do
+              osarch=$(basename $(dirname "$libfile"))
+              mkdir -p "all/uc/j/native/$osarch"
+              cp -v "$libfile" "all/uc/j/native/$osarch/"
+          done
+
+      - name: Create universal JAR
+        run: |
+          cd all
+          jar cf ../osclock-universal.jar uc/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osclock-universal
+          path: osclock-universal.jar
+
+      - name: Clean up intermediate artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: |
+            java-build
+            artifact-*
+          failOnError: false
