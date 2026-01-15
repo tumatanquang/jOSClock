@@ -1,0 +1,5 @@
+inline uc/j/OSClock currentTimeMillis
+inline uc/j/OSClock nanoTime
+inline uc/j/OSClock monotonicNanos
+inline uc/j/OSClock epochMillis
+inline uc/j/OSClock epochSeconds
